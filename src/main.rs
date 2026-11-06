@@ -8,6 +8,7 @@ mod auto;
 mod canvas;
 mod data;
 mod font;
+mod log;
 mod net;
 mod png;
 mod render;
@@ -43,6 +44,7 @@ struct Cli {
     process_latest: bool,
     fetch_once: bool,
     from_json: Option<PathBuf>,
+    log_file: Option<PathBuf>,
 }
 
 fn parse_args() -> Cli {
@@ -62,6 +64,7 @@ fn parse_args() -> Cli {
             "--process-latest" => c.process_latest = true,
             "--fetch-once" => c.fetch_once = true,
             "--from-json" => { c.from_json = Some(PathBuf::from(val())); i += 1; }
+            "--log" => { c.log_file = Some(PathBuf::from(val())); i += 1; }
             "--lat" => { c.lat = val().parse().ok(); i += 1; }
             "--lon" => { c.lon = val().parse().ok(); i += 1; }
             "--name" => { c.name = Some(val()); i += 1; }
@@ -102,6 +105,7 @@ fn help() {
   --out              手动模式输出文件
   --outdir           自动模式输出目录（默认 output/auto）
   --interval         自动模式轮询秒数（默认 3，限速 60 次/分）
+  --log              日志文件（默认 <outdir>/standby.log，超过 4MB 自动轮转）
   --port             手动界面端口（默认 18787，占用时自动顺延）
   --include-test     自动模式也处理测试报
   --process-latest   自动模式启动时处理最新一条历史报
@@ -189,6 +193,18 @@ fn main() {
         return;
     }
     if cli.auto {
+        let log_path = cli
+            .log_file
+            .clone()
+            .unwrap_or_else(|| cli.outdir.join("standby.log"));
+        log::init(log_path);
+        log::info(&format!(
+            "==== 进程启动 pid={} exe={} cwd={} interval={}s ====",
+            std::process::id(),
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default(),
+            cli.interval
+        ));
         let st = auto::AutoState {
             out_dir: cli.outdir.clone(),
             interval: cli.interval,

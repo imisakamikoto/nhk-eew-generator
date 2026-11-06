@@ -7,10 +7,93 @@ use std::path::PathBuf;
 
 use crate::data::{load_epicenters, load_geo, Epicenter, Geo};
 use crate::font::Font;
+use crate::log;
 use crate::render::{self, Input, FONT_HEAVY, FONT_MEDIUM};
 
 const GEO_BIN: &[u8] = include_bytes!("../data/geometry.bin");
 const EPICENTER_BIN: &[u8] = include_bytes!("../data/epicenters.bin");
+
+// ---- PWA 资源（内嵌，无外部依赖） ----
+const ICON_192: &[u8] = include_bytes!("../assets/web/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("../assets/web/icon-512.png");
+const ICON_MASKABLE: &[u8] = include_bytes!("../assets/web/icon-maskable-512.png");
+const ICON_APPLE: &[u8] = include_bytes!("../assets/web/apple-touch-icon.png");
+const ICON_FAVICON: &[u8] = include_bytes!("../assets/web/favicon.png");
+
+const MANIFEST: &str = r##"{
+  "name": "緊急地震速報 画像ジェネレーター",
+  "short_name": "EEW",
+  "description": "仿 NHK 緊急地震速報 画面生成器：输入震源经纬度与警报府县即可出图",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "id": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0b1220",
+  "theme_color": "#10151f",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "示例：福岡県北西沖", "short_name": "示例", "url": "/?demo=1" }
+  ]
+}"##;
+
+const SW_JS: &str = r#"const CACHE = 'eew-shell-v1';
+const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png', '/icon-maskable-512.png', '/apple-touch-icon.png'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  const url = new URL(req.url);
+  if (url.origin !== location.origin) return;
+
+  if (req.method !== 'GET') {
+    if (url.pathname === '/api/render') {
+      e.respondWith(fetch(req).catch(() => new Response(
+        JSON.stringify({ ok: false, note: '离线：本地生成服务未运行' }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } }
+      )));
+    }
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    e.respondWith(
+      fetch(req)
+        .then(r => { const cp = r.clone(); caches.open(CACHE).then(c => c.put('/', cp)); return r; })
+        .catch(() => caches.match('/'))
+    );
+    return;
+  }
+
+  e.respondWith(
+    caches.match(req).then(hit => hit || fetch(req).then(r => {
+      const cp = r.clone();
+      caches.open(CACHE).then(c => c.put(req, cp));
+      return r;
+    }))
+  );
+});
+"#;
+
 
 pub struct ServerState {
     pub port: u16,
@@ -122,13 +205,17 @@ fn page(geo: &Geo, state: &ServerState) -> String {
         .replace("__PORT__", &state.port.to_string())
 }
 
-fn respond(stream: &mut TcpStream, code: &str, ctype: &str, body: &[u8]) {
+fn respond_cached(stream: &mut TcpStream, code: &str, ctype: &str, cache: &str, body: &[u8]) {
     let head = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
-        code, ctype, body.len());
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+        code, ctype, body.len(), cache);
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
+}
+
+fn respond(stream: &mut TcpStream, code: &str, ctype: &str, body: &[u8]) {
+    respond_cached(stream, code, ctype, "no-store", body);
 }
 
 fn handle(mut stream: TcpStream, geo: &Geo, eps: &[Epicenter], heavy: &Font, medium: &Font,
@@ -176,6 +263,26 @@ fn handle(mut stream: TcpStream, geo: &Geo, eps: &[Epicenter], heavy: &Font, med
         respond(&mut stream, "200 OK", "text/html; charset=utf-8", html.as_bytes());
         return;
     }
+    // ---- PWA ----
+    if method == "GET" {
+        let pwa: Option<(&[u8], &str, &str)> = match path.as_str() {
+            "/manifest.webmanifest" | "/manifest.json" => {
+                Some((MANIFEST.as_bytes(), "application/manifest+json; charset=utf-8", "no-cache"))
+            }
+            // 必须允许频繁刷新，否则新版本 SW 无法生效
+            "/sw.js" => Some((SW_JS.as_bytes(), "text/javascript; charset=utf-8", "no-cache")),
+            "/icon-192.png" => Some((ICON_192, "image/png", "public, max-age=604800")),
+            "/icon-512.png" => Some((ICON_512, "image/png", "public, max-age=604800")),
+            "/icon-maskable-512.png" => Some((ICON_MASKABLE, "image/png", "public, max-age=604800")),
+            "/apple-touch-icon.png" => Some((ICON_APPLE, "image/png", "public, max-age=604800")),
+            "/favicon.ico" | "/favicon.png" => Some((ICON_FAVICON, "image/png", "public, max-age=604800")),
+            _ => None,
+        };
+        if let Some((body, ctype, cache)) = pwa {
+            respond_cached(&mut stream, "200 OK", ctype, cache, body);
+            return;
+        }
+    }
     if method == "POST" && path == "/api/render" {
         let f = parse_form(&body);
         let lat = f.get("lat").and_then(|v| v.parse::<f64>().ok()).unwrap_or(34.446);
@@ -217,19 +324,28 @@ pub fn run(mut state: ServerState) {
         }
     }
     let listener = listener.unwrap_or_else(|| panic!("无法在 {}~{} 找到空闲端口", state.port, state.port + 11));
-    println!("[手动] 界面已就绪: http://127.0.0.1:{}", state.port);
+    log::info(&format!("[手动] 界面已就绪: http://127.0.0.1:{}", state.port));
     for stream in listener.incoming() {
         match stream {
             Ok(s) => handle(s, &geo, &eps, &heavy, &medium, &state),
-            Err(e) => eprintln!("[手动] 连接错误: {}", e),
+            Err(e) => log::warn(&format!("[手动] 连接错误: {}", e)),
         }
     }
 }
 
-const HTML: &str = r#"<!DOCTYPE html>
+const HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>緊急地震速報ジェネレーター</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#10151f">
+<meta name="color-scheme" content="dark">
+<link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="EEW">
 <style>
 :root{--bg:#10151f;--panel:#1a2230;--line:#2c3849;--fg:#e8eef7;--sub:#93a3b8;--red:#e63960;--blue:#3b73c6;--yellow:#f7fc5f}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
@@ -257,8 +373,21 @@ button.primary:hover{filter:brightness(1.12)}
 .note{margin-top:12px;font-size:13px;color:var(--sub);text-align:center;width:100%}
 .note b{color:var(--yellow)}
 .foot{padding:0 26px 24px;color:var(--sub);font-size:12px}
+#install{margin-left:auto;background:transparent;border-color:var(--yellow);color:var(--yellow)}
+#install[hidden]{display:none}
+@media (max-width:860px){
+  .wrap{grid-template-columns:1fr;padding:14px;gap:14px}
+  header{padding:14px 16px 14px calc(16px + env(safe-area-inset-left))}
+  header h1{font-size:16px}
+  .foot{padding:0 16px calc(20px + env(safe-area-inset-bottom))}
+  .areas{max-height:44vh}
+  body{overscroll-behavior-y:contain}
+}
+@media (display-mode:standalone){
+  header{padding-top:calc(14px + env(safe-area-inset-top))}
+}
 </style></head><body>
-<header><h1>緊急地震速報 画像ジェネレーター</h1><span class="tag">Rust / P2P地震情報 v2</span><span class="tag" id="autotag">__AUTO__</span></header>
+<header><h1>緊急地震速報 画像ジェネレーター</h1><span class="tag">Rust / P2P地震情報 v2</span><span class="tag" id="autotag">__AUTO__</span><button id="install" hidden>安装到桌面</button></header>
 <div class="wrap">
  <div class="card">
   <h2>手動生成</h2>
@@ -308,4 +437,26 @@ async function gen(){
 }
 $('#gen').onclick=gen;
 syncGroups();
-</script></body></html>"#;
+
+// ---- PWA ----
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/sw.js').catch(()=>{});
+}
+let deferredPrompt=null;
+const ib=$('#install');
+function showInstall(label){if(!ib)return;ib.hidden=false;ib.textContent=label}
+addEventListener('beforeinstallprompt',e=>{
+  e.preventDefault();deferredPrompt=e;showInstall('安装到桌面');
+});
+if(ib)ib.onclick=async()=>{
+  if(deferredPrompt){
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    deferredPrompt=null;ib.hidden=true;return;
+  }
+  alert('Safari：点击底部「分享」→「添加到主屏幕」');
+};
+if(/iPad|iPhone|iPod/.test(navigator.userAgent)&&!navigator.standalone){showInstall('添加到主屏幕')}
+addEventListener('appinstalled',()=>{if(ib)ib.hidden=true});
+if(location.search.indexOf('demo=1')>=0){$('#demo').click()}
+</script></body></html>"##;

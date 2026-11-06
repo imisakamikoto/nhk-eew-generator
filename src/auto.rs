@@ -1,13 +1,20 @@
 //! Standby mode: poll P2P地震情報 for new code-556 reports and write PNGs.
+//!
+//! 设计要点（后台常驻）：
+//! * 单次巡检包在 `catch_unwind` 里，任何解析/绘制异常都不会让待机线程退出
+//! * 网络错误只在「健康→故障」和「故障→恢复」时各记一次，避免日志刷屏
+//! * 每 20 分钟写一条心跳，便于确认进程还活着
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::data::{load_epicenters, load_geo, Epicenter, Geo};
 use crate::font::Font;
+use crate::log;
 use crate::net::{self, EewEvent};
 use crate::render::{self, Input, FONT_HEAVY, FONT_MEDIUM};
 
@@ -21,8 +28,9 @@ pub struct AutoState {
     pub process_latest_on_start: bool,
 }
 
+/// 生成一张（或一张取消画面），返回是否写入成功。
 pub fn write_png(dir: &PathBuf, event: &EewEvent, geo: &Geo, eps: &[Epicenter],
-                 heavy: &Font, medium: &Font) {
+                 heavy: &Font, medium: &Font) -> bool {
     let prefs = geo.normalize_prefs(&event.prefs);
     let input = Input {
         lat: if event.has_coords { event.lat } else { 35.0 },
@@ -36,67 +44,138 @@ pub fn write_png(dir: &PathBuf, event: &EewEvent, geo: &Geo, eps: &[Epicenter],
     let path = dir.join(&name);
     match fs::write(&path, &out.png) {
         Ok(_) => {
-            println!("[自动] {}  (eventId={} serial={} 取消={} 区域={}) {}",
-                     name, event.event_id, event.serial, event.cancelled,
-                     out.lines.iter().flatten().cloned().collect::<Vec<_>>().join("·"),
-                     out.note);
+            log::info(&format!(
+                "[自动] {}  (eventId={} serial={} 取消={} 区域={}) {}",
+                name, event.event_id, event.serial, event.cancelled,
+                out.lines.iter().flatten().cloned().collect::<Vec<_>>().join("·"),
+                out.note
+            ));
             let _ = fs::write(dir.join("latest.png"), &out.png);
+            true
         }
-        Err(e) => eprintln!("[自动] 写入失败 {}: {}", path.display(), e),
+        Err(e) => {
+            log::warn(&format!("[自动] 写入失败 {}: {}", path.display(), e));
+            false
+        }
     }
+}
+
+struct Ctx {
+    geo: Geo,
+    eps: Vec<Epicenter>,
+    heavy: Font,
+    medium: Font,
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+    first: bool,
+}
+
+/// 一次巡检：拉取 → 去重 → 出图。返回本次新生成的张数；错误通过 Err 返回。
+fn tick(ctx: &mut Ctx, state: &AutoState) -> Result<usize, String> {
+    let events = net::fetch()?;
+    let mut written = 0usize;
+    if ctx.first {
+        if state.process_latest_on_start {
+            if let Some(e) = events.first() {
+                if !(e.test && !state.include_test) {
+                    if write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
+                        written += 1;
+                    }
+                }
+            }
+        } else {
+            log::info(&format!("[自动] 已同步 {} 条历史记录，等待新报…", events.len()));
+        }
+        for e in &events {
+            ctx.seen.insert(e.id.clone());
+            ctx.order.push_back(e.id.clone());
+        }
+        ctx.first = false;
+    } else {
+        for e in &events {
+            if ctx.seen.contains(&e.id) {
+                continue;
+            }
+            ctx.seen.insert(e.id.clone());
+            ctx.order.push_back(e.id.clone());
+            if e.test && !state.include_test {
+                log::info(&format!("[自动] 跳过测试报 {}", e.id));
+                continue;
+            }
+            if write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
+                written += 1;
+            }
+        }
+    }
+    while ctx.order.len() > 400 {
+        if let Some(old) = ctx.order.pop_front() {
+            ctx.seen.remove(&old);
+        }
+    }
+    Ok(written)
 }
 
 pub fn run(state: AutoState) {
     fs::create_dir_all(&state.out_dir).ok();
-    let geo: Geo = load_geo(GEO_BIN);
-    let eps: Vec<Epicenter> = load_epicenters(EPICENTER_BIN);
-    let heavy = Font::new(FONT_HEAVY);
-    let medium = Font::new(FONT_MEDIUM);
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut order: VecDeque<String> = VecDeque::new();
-    let mut first = true;
-    println!("[自动] 待机中：每 {} 秒检查一次 code=556（緊急地震速報・警報）", state.interval);
-    println!("[自动] 输出目录: {}", state.out_dir.display());
+    let mut ctx = Ctx {
+        geo: load_geo(GEO_BIN),
+        eps: load_epicenters(EPICENTER_BIN),
+        heavy: Font::new(FONT_HEAVY),
+        medium: Font::new(FONT_MEDIUM),
+        seen: HashSet::new(),
+        order: VecDeque::new(),
+        first: true,
+    };
+    let started = Instant::now();
+    let mut polls: u64 = 0;
+    let mut total: u64 = 0;
+    let mut failing = false;
+    let mut last_beat = Instant::now();
+
+    log::info(&format!(
+        "[自动] 待机中：每 {} 秒检查一次 code=556（緊急地震速報・警報）",
+        state.interval
+    ));
+    log::info(&format!("[自动] 输出目录: {}", state.out_dir.display()));
+
     loop {
-        match net::fetch() {
-            Ok(events) => {
-                if first {
-                    if state.process_latest_on_start {
-                        if let Some(e) = events.first() {
-                            if !(e.test && !state.include_test) {
-                                write_png(&state.out_dir, e, &geo, &eps, &heavy, &medium);
-                            }
-                        }
-                    } else {
-                        println!("[自动] 已同步 {} 条历史记录，等待新报…", events.len());
-                    }
-                    for e in &events {
-                        seen.insert(e.id.clone());
-                        order.push_back(e.id.clone());
-                    }
-                    first = false;
-                } else {
-                    for e in &events {
-                        if seen.contains(&e.id) {
-                            continue;
-                        }
-                        seen.insert(e.id.clone());
-                        order.push_back(e.id.clone());
-                        if e.test && !state.include_test {
-                            println!("[自动] 跳过测试报 {}", e.id);
-                            continue;
-                        }
-                        write_png(&state.out_dir, e, &geo, &eps, &heavy, &medium);
-                    }
-                }
-                while order.len() > 400 {
-                    if let Some(old) = order.pop_front() {
-                        seen.remove(&old);
-                    }
+        polls += 1;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| tick(&mut ctx, &state)));
+        match result {
+            Ok(Ok(n)) => {
+                total += n as u64;
+                if failing {
+                    log::info("[自动] 网络/接口已恢复");
+                    failing = false;
                 }
             }
-            Err(e) => eprintln!("[自动] {}", e),
+            Ok(Err(e)) => {
+                if !failing {
+                    log::warn(&format!("[自动] 取数失败（将持续重试）: {}", e));
+                    failing = true;
+                }
+            }
+            Err(_) => {
+                log::warn("[自动] 本次巡检出现异常，已捕获并继续待机");
+            }
         }
+
+        if last_beat.elapsed() >= Duration::from_secs(20 * 60) {
+            last_beat = Instant::now();
+            log::info(&format!(
+                "[自动] 心跳：已运行 {}，轮询 {} 次，累计出图 {} 张，状态={}",
+                human_duration(started.elapsed()),
+                polls,
+                total,
+                if failing { "取数异常" } else { "正常" }
+            ));
+        }
+
         thread::sleep(Duration::from_secs(state.interval.max(2)));
     }
+}
+
+fn human_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    format!("{}天{}小时{}分", s / 86_400, (s % 86_400) / 3600, (s % 3600) / 60)
 }

@@ -1,0 +1,15 @@
+[package]
+name = "eew-generator"
+version = "1.0.0"
+edition = "2021"
+description = "NHK 风格紧急地震速报图片生成器"
+
+[dependencies]
+ttf-parser = "0.25"
+serde_json = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

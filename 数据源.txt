@@ -1,0 +1,131 @@
+P2P地震情報 API仕様書
+ 2.3.0 
+OAS3
+/swagger-ui/specification.yaml
+気象庁の「緊急地震速報（警報）」「地震情報」「津波予報」と、P2P地震情報ユーザーの「地震感知情報」が取得できます。
+商用・非商用問わず無償（無料）でご利用になれます。 二次利用できます · P2P地震情報 をご確認ください。
+以下のレート制限があります。レート制限を超えたリクエストが続く場合、アクセスを拒否することがあります。
+/history: 60 リクエスト/分 (IP アドレス毎)
+/jma: 10 リクエスト/分 (IP アドレス毎)
+/ws: 2 接続 (IP アドレス毎)
+動作確認用に、サンドボックスのエンドポイントを用意しています。
+サンドボックス詳細
+Servers
+
+https://api.p2pquake.net/v2 - 本番環境（実際の情報を配信）
+P2P地震情報 API
+
+GET
+​/history
+P2P地震情報 JSON API (v2)
+GET
+​/ws
+P2P地震情報 WebSocket API
+気象庁 地震情報・津波予報 JSON API
+
+GET
+​/jma​/quake
+地震情報リスト
+GET
+​/jma​/quake​/{id}
+地震情報
+GET
+​/jma​/tsunami
+津波予報リスト
+GET
+​/jma​/tsunami​/{id}
+津波予報
+Schemas
+BasicData
+JMAQuake
+JMAQuakes
+JMATsunami
+JMATsunamis
+Userquake
+Areapeers
+EEWDetection
+EEW{
+description:	
+緊急地震速報（警報）の内容です。ただし、以下の点に留意してください。
+
+内容や配信品質は無保証です。緊急地震速報（警報）としての利活用は非推奨です。
+多くの項目は気象庁防災情報XMLフォーマット ｜ 技術資料の定義そのままです。地震の規模や予測震度なども提供しますが、緊急地震速報（警報）では発表されない内容です（参考：気象庁｜緊急地震速報｜緊急地震速報（警報）及び（予報）について）。
+スキーマは今後拡張する可能性があります。
+遅延や欠落のリスクは以下の通りです。
+
+処理遅延: WebSocket API は約 70ms 、 JSON API は約 1000 ms （高負荷時はさらに遅延します）
+サーバ所在地: 東京 (Linode Tokyo 2)
+欠落リスク: サーバや受信プログラムは冗長化しておらず、障害時は配信できず、復旧時の再配信もありません
+id*	string
+情報を一意に識別するID
+
+code*	integer($int32)
+情報コード。常に556です。
+
+time*	string
+受信日時。形式は 2006/01/02 15:04:05.999 です。
+
+test	boolean
+テストかどうか。
+
+earthquake	{
+description:	
+地震の情報。ただし、取消の場合は値は設定されません。
+
+originTime*	string
+地震発生時刻
+
+arrivalTime*	string
+地震発現時刻
+
+condition	string
+仮定震源要素の場合、値は "仮定震源要素" となります。
+
+hypocenter*	{...}
+}
+issue*	{
+time*	string
+発表時刻
+
+eventId*	string
+識別情報
+
+serial*	string
+情報番号
+
+}
+cancelled*	boolean
+取消
+
+areas	[
+細分区域
+
+{
+pref*	string
+府県予報区
+
+name*	string
+地域名（細分区域名）
+
+scaleFrom*	number
+最大予測震度の下限
+システムの都合で小数点が付きますが整数部のみ有効です。
+
+Enum:
+[ -1(不明), 0(震度0), 10(震度1), 20(震度2), 30(震度3), 40(震度4), 45(震度5弱), 50(震度5強), 55(震度6弱), 60(震度6強), 70(震度7) ]
+scaleTo*	number
+最大予測震度の上限
+システムの都合で小数点が付きますが整数部のみ有効です。
+
+Enum:
+[ -1(不明), 0(震度0), 10(震度1), 20(震度2), 30(震度3), 40(震度4), 45(震度5弱), 50(震度5強), 55(震度6弱), 60(震度6強), 70(震度7), 99(～程度以上) ]
+kindCode	string
+警報コード
+
+Enum:
+Array [ 3 ]
+arrivalTime	string
+主要動の到達予測時刻
+
+}]
+}

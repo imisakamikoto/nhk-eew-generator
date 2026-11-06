@@ -1,0 +1,22 @@
+# Rust 编译产物
+/target/
+
+# 运行时输出（图片由程序生成）
+/output/
+
+# 分析与调参中间产物
+/analysis/
+
+# 原始 GIS 数据（.shp 单文件 140MB+，超出 GitHub 单文件 100MB 限制）
+# 运行时只需要 data/geometry.bin 与 data/epicenters.bin，已入库
+/data/gis/
+
+# 第三方原始压缩包（字体已解压到 assets/fonts，GIS 已编译为 data/*.bin）
+*.zip
+
+# 编辑器 / 系统
+.workbuddy/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

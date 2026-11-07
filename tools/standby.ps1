@@ -34,19 +34,12 @@ if (-not $created) {
 
 $restarts = 0
 while ($true) {
-    # OBS linkage: read the password straight from obs-websocket's own config so
-    # it keeps working after the user changes it in OBS (nothing hardcoded here).
-    $argList = @('--auto', '--interval', '3', '--obs-ws', '--obs-source', 'EEW-Overlay', '--obs-hold', '20')
-    $obsCfg = Join-Path $env:APPDATA 'obs-studio\plugin_config\obs-websocket\config.json'
-    if (Test-Path -LiteralPath $obsCfg) {
-        try {
-            $cfg = Get-Content -LiteralPath $obsCfg -Raw | ConvertFrom-Json
-            if ($cfg.server_password) { $argList += @('--obs-password', [string]$cfg.server_password) }
-            if ($cfg.server_port) { $argList += @('--obs-port', [string]$cfg.server_port) }
-        } catch {
-            Write-Log "obs-websocket config unreadable; continuing without password"
-        }
-    }
+    # Browser-source overlay is the default linkage: the /obs page stays loaded
+    # (transparent) and cuts in/out by itself. Do NOT add --obs-ws here: hiding
+    # the browser source would unload the page and it could miss the next alert.
+    # --obs-ws is for the "image source" setup, where a static file needs OBS
+    # to show/hide it. Add it manually to $argList if you use that setup.
+    $argList = @('--auto', '--interval', '3', '--obs-hold', '20')
     $start = Get-Date
     $code = -1
     try {

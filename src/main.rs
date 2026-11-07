@@ -144,7 +144,7 @@ OBS 播出联动（NHK 式瞬间弹出 / 无字幕）:
 
   --obs-dir <path>   OBS 热更新图目录（默认 output/obs）
   --obs-hold <sec>   警报画面保持秒数（默认 20，取消报自动缩短到 10）
-  --obs-ws           启用 obs-websocket 联动：新报显示来源、播完隐藏
+  --obs-ws           启用 obs-websocket 显隐（仅图像源方案需要；浏览器源不要开）
   --obs-source <n>   OBS 来源名（默认 EEW-Overlay）
   --obs-scene <n>    OBS 场景名（留空用当前场景）
   --obs-password <p> obs-websocket 密码（OBS 里没设密码就不填）

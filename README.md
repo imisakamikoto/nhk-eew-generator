@@ -99,11 +99,20 @@ python tools/obs_setup.py --hide                   # 手动隐藏来源
 |---|---|---|
 | **浏览器源**（推荐） | OBS 加浏览器源指向 `/obs` | 透明叠加、提示音、瞬间弹出/消失、自动收起，零配置 |
 | **图像源** | OBS 图像源指向 `output/obs/overlay.png` | 每次新报原子替换并自动刷新，最稳，但无音效与自动收起 |
-| **obs-websocket** | 启动加 `--obs-ws --obs-source EEW-Overlay` | 新报显示指定来源、播完隐藏，可与图像源方案叠加使用 |
+| **obs-websocket** | 启动加 `--obs-ws --obs-source EEW-Image` | 新报显示指定来源、播完隐藏，配合「图像源」方案使用 |
 
-自启动脚本 `tools/standby.ps1` 已带 `--obs-ws`，并直接从
-`%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json` 读取密码与端口，
-OBS 里改密码后无需改本项目的配置。
+> **不要对浏览器源开 `--obs-ws`**：播完隐藏来源会让页面卸载，重新加载时
+> 浏览器源会把当前 seq 当作「已播过」，下一次新报可能来不及弹出。
+> 浏览器源应保持常驻可见（透明背景），由页面自己完成硬切。
+> `--obs-ws` 是给「图像源」方案用的：静态图片文件不会自己消失，需要 OBS 来显隐。
+> 若要用它，把 `--obs-source` 指向图像源，并从 OBS 的 WebSocket 设置里取密码：
+>
+> ```bash
+> eew-generator --auto --obs-ws --obs-source EEW-Image --obs-password <OBS里的密码>
+> ```
+
+`tools/obs_setup.py` 会自动读取 `%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json`
+里的密码与端口，OBS 里改密码后无需改本项目的配置。
 
 ### 页面参数
 

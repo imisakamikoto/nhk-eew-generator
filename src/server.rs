@@ -1,13 +1,17 @@
-//! Tiny dependency-free HTTP server for the manual generation UI.
+//! Tiny dependency-free HTTP server for the manual generation UI and OBS overlay.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 
 use crate::data::{load_epicenters, load_geo, Epicenter, Geo};
 use crate::font::Font;
 use crate::log;
+use crate::obs;
+use crate::obsws;
 use crate::render::{self, Input, FONT_HEAVY, FONT_MEDIUM};
 
 const GEO_BIN: &[u8] = include_bytes!("../data/geometry.bin");
@@ -99,9 +103,20 @@ pub struct ServerState {
     pub port: u16,
     pub out_dir: PathBuf,
     pub auto_enabled: bool,
+    pub overlay: obs::Shared,
+    pub obs_ws: Option<obsws::Config>,
+    pub obs_hold: u64,
 }
 
-fn b64(data: &[u8]) -> String {
+struct ServerCtx {
+    geo: Geo,
+    eps: Vec<Epicenter>,
+    heavy: Font,
+    medium: Font,
+    state: ServerState,
+}
+
+pub fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity((data.len() + 2) / 3 * 4);
     for c in data.chunks(3) {
@@ -116,7 +131,7 @@ fn b64(data: &[u8]) -> String {
     s
 }
 
-fn json_escape(s: &str) -> String {
+pub fn json_escape(s: &str) -> String {
     let mut o = String::new();
     for c in s.chars() {
         match c {
@@ -203,6 +218,33 @@ fn page(geo: &Geo, state: &ServerState) -> String {
     HTML.replace("__PREFS__", &pref_html(geo))
         .replace("__AUTO__", &auto)
         .replace("__PORT__", &state.port.to_string())
+        .replace("__HOLDMSG__", &state.obs_hold.to_string())
+}
+
+fn obs_page(state: &ServerState) -> String {
+    OBS_HTML.replace("__HOLD__", &state.obs_hold.to_string())
+}
+
+/// 当前播出状态的轻量 JSON（不含图片），浏览器源每 250ms 拉一次。
+fn overlay_state_json(sh: &obs::Shared) -> String {
+    let (seq, hidden, cur) = match sh.lock() {
+        Ok(g) => (g.seq, g.hidden, g.current.clone()),
+        Err(_) => return "{\"seq\":0,\"hidden\":true,\"has\":false}".to_string(),
+    };
+    let lines = cur.as_ref().map(|e| {
+        e.lines.iter()
+            .map(|l| format!("[{}]", l.iter().map(|s| format!("\"{}\"", json_escape(s)))
+                .collect::<Vec<_>>().join(",")))
+            .collect::<Vec<_>>().join(",")
+    }).unwrap_or_default();
+    match cur {
+        Some(e) => format!(
+            "{{\"seq\":{},\"hidden\":{},\"has\":true,\"cancel\":{},\"test\":{},\"at\":\"{}\",\"eventId\":\"{}\",\"serial\":\"{}\",\"epicenter\":\"{}\",\"note\":\"{}\",\"lines\":[{}]}}",
+            seq, hidden, e.cancel, e.is_test,
+            json_escape(&e.at), json_escape(&e.event_id), json_escape(&e.serial),
+            json_escape(&e.epicenter), json_escape(&e.note), lines),
+        None => format!("{{\"seq\":{},\"hidden\":{},\"has\":false}}", seq, hidden),
+    }
 }
 
 fn respond_cached(stream: &mut TcpStream, code: &str, ctype: &str, cache: &str, body: &[u8]) {
@@ -218,8 +260,12 @@ fn respond(stream: &mut TcpStream, code: &str, ctype: &str, body: &[u8]) {
     respond_cached(stream, code, ctype, "no-store", body);
 }
 
-fn handle(mut stream: TcpStream, geo: &Geo, eps: &[Epicenter], heavy: &Font, medium: &Font,
-          state: &ServerState) {
+fn handle(mut stream: TcpStream, ctx: &Arc<ServerCtx>) {
+    let state = &ctx.state;
+    let geo = &ctx.geo;
+    let eps = &ctx.eps;
+    let heavy = &ctx.heavy;
+    let medium = &ctx.medium;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     let header_end;
@@ -242,7 +288,11 @@ fn handle(mut stream: TcpStream, geo: &Geo, eps: &[Epicenter], heavy: &Font, med
     let first = lines.next().unwrap_or("");
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("/").to_string();
+    let raw_path = parts.next().unwrap_or("/").to_string();
+    let (path, _query) = match raw_path.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (raw_path, String::new()),
+    };
     let mut content_len = 0usize;
     for l in lines {
         if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
@@ -282,6 +332,54 @@ fn handle(mut stream: TcpStream, geo: &Geo, eps: &[Epicenter], heavy: &Font, med
             respond_cached(&mut stream, "200 OK", ctype, cache, body);
             return;
         }
+    }
+    // ---- OBS 播出联动 ----
+    if method == "GET" && path == "/obs" {
+        respond(&mut stream, "200 OK", "text/html; charset=utf-8", obs_page(state).as_bytes());
+        return;
+    }
+    if method == "GET" && path == "/api/overlay/state" {
+        respond(&mut stream, "200 OK", "application/json; charset=utf-8",
+                overlay_state_json(&state.overlay).as_bytes());
+        return;
+    }
+    if method == "GET" && path == "/api/overlay/png" {
+        let cur = match state.overlay.lock() { Ok(g) => g.current.clone(), Err(_) => None };
+        match cur {
+            Some(e) => respond_cached(&mut stream, "200 OK", "image/png", "no-store", &e.png),
+            None => respond(&mut stream, "404 Not Found", "text/plain; charset=utf-8", b"no alert"),
+        }
+        return;
+    }
+    if method == "POST" && path == "/api/overlay/test" {
+        let f = parse_form(&body);
+        let cancel = f.get("mode").map(|v| v == "cancel").unwrap_or(false);
+        let lat = f.get("lat").and_then(|v| v.parse::<f64>().ok()).unwrap_or(34.446);
+        let lon = f.get("lon").and_then(|v| v.parse::<f64>().ok()).unwrap_or(129.065);
+        let name = f.get("name").cloned().unwrap_or_default();
+        let raw: Vec<String> = f.get("prefs")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_else(|| vec!["福岡", "長崎", "佐賀", "大分", "山口", "熊本"]
+                .into_iter().map(String::from).collect());
+        let input = Input {
+            lat, lon,
+            prefs: geo.normalize_prefs(&raw),
+            epicenter: if name.trim().is_empty() { None } else { Some(name.trim().to_string()) },
+            cancel,
+        };
+        let out = render::render(&input, geo, eps, heavy, medium);
+        let (lines, png, epic, note) = (out.lines, out.png, out.epicenter, out.note);
+        let ev = obs::event(0, cancel, true, "REHEARSAL", "1", &epic, &note, lines, png);
+        let seq = obs::publish_and_arm(&state.overlay, ev, state.obs_ws.clone(), state.obs_hold);
+        respond(&mut stream, "200 OK", "application/json; charset=utf-8",
+                format!("{{\"ok\":true,\"seq\":{}}}", seq).as_bytes());
+        return;
+    }
+    if method == "POST" && path == "/api/overlay/hide" {
+        let seq = obs::hide(&state.overlay);
+        respond(&mut stream, "200 OK", "application/json; charset=utf-8",
+                format!("{{\"ok\":true,\"seq\":{}}}", seq).as_bytes());
+        return;
     }
     if method == "POST" && path == "/api/render" {
         let f = parse_form(&body);
@@ -324,14 +422,105 @@ pub fn run(mut state: ServerState) {
         }
     }
     let listener = listener.unwrap_or_else(|| panic!("无法在 {}~{} 找到空闲端口", state.port, state.port + 11));
-    log::info(&format!("[手动] 界面已就绪: http://127.0.0.1:{}", state.port));
+    // 浏览器源会持续轮询，必须并发处理，否则一个连接就把整个服务堵死
+    let ctx = Arc::new(ServerCtx { geo, eps, heavy, medium, state });
+    log::info(&format!("[手动] 界面已就绪: http://127.0.0.1:{}", ctx.state.port));
+    log::info(&format!("[OBS] 浏览器源: http://127.0.0.1:{}/obs", ctx.state.port));
     for stream in listener.incoming() {
         match stream {
-            Ok(s) => handle(s, &geo, &eps, &heavy, &medium, &state),
+            Ok(s) => {
+                let c = ctx.clone();
+                thread::spawn(move || handle(s, &c));
+            }
             Err(e) => log::warn(&format!("[手动] 连接错误: {}", e)),
         }
     }
 }
+
+/// OBS 浏览器源：透明背景、瞬间硬切显示/消失、无字幕。
+/// NHK 的速报是「啪」地一下覆盖到节目画面上，所以这里刻意不写任何
+/// transition / animation / opacity 渐变；图片预加载完成后直接 display:block。
+const OBS_HTML: &str = r##"<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<title>EEW Overlay</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:transparent;overflow:hidden}
+#card{position:absolute;left:50%;top:70%;width:63%;transform:translate(-50%,-50%);display:none}
+#card img{display:block;width:100%;height:auto}
+body.preview{background:#0d1b2a}
+body.preview #card{filter:drop-shadow(0 18px 40px rgba(0,0,0,.55))}
+#hint{display:none;position:fixed;left:14px;bottom:12px;font:12px/1.5 monospace;color:#8fb3d9;opacity:.7}
+body.preview #hint{display:block}
+</style></head><body>
+<div id="card"><img id="shot" alt=""></div>
+<div id="hint">PREVIEW MODE — 背景与这行文字在 OBS 里不会出现</div>
+<script>
+const q=new URLSearchParams(location.search);
+const DEF_HOLD=__HOLD__;
+const HOLD=q.has('hold')?Math.max(1,parseInt(q.get('hold'))||DEF_HOLD):DEF_HOLD;
+const SOUND=q.get('sound')!=='0'&&q.get('sound')!=='false';
+const W=q.get('full')==='1'?100:Math.min(100,Math.max(15,parseFloat(q.get('w')||'63')||63));
+const Y=Math.min(100,Math.max(0,parseFloat(q.get('y')||'70')||70));
+const REPLAY=q.get('replay')==='1', PREVIEW=q.get('preview')==='1', POLL=250;
+const card=document.getElementById('card'), shot=document.getElementById('shot');
+card.style.width=W+'%'; card.style.top=Y+'%';
+if(PREVIEW)document.body.classList.add('preview');
+let last=-1, hideTimer=null, ac=null, first=true;
+
+function hideNow(){clearTimeout(hideTimer);card.style.display='none'}
+function chime(){
+  if(!SOUND)return;
+  try{
+    const AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC)return;
+    if(!ac)ac=new AC();
+    if(ac.state==='suspended')ac.resume();
+    const t=ac.currentTime+0.005;
+    // NHK 緊急地震速報のチャイム：上行二音を二度
+    [[880,0],[1174.66,0.22],[880,0.55],[1174.66,0.77]].forEach(([f,dt])=>{
+      const o=ac.createOscillator(), h=ac.createOscillator(), g=ac.createGain(), hg=ac.createGain();
+      o.type='sine';o.frequency.setValueAtTime(f,t+dt);
+      h.type='sine';h.frequency.setValueAtTime(f*2,t+dt);hg.gain.value=.16;
+      h.connect(hg).connect(g);o.connect(g);g.connect(ac.destination);
+      g.gain.setValueAtTime(.0001,t+dt);
+      g.gain.exponentialRampToValueAtTime(.22,t+dt+.008);
+      g.gain.exponentialRampToValueAtTime(.0001,t+dt+.19);
+      o.start(t+dt);o.stop(t+dt+.21);h.start(t+dt);h.stop(t+dt+.21);
+    });
+  }catch(e){}
+}
+function show(s){
+  const url='/api/overlay/png?v='+s.seq;
+  const pre=new Image();
+  pre.onload=()=>{
+    if(s.seq!==last)return;            // 加载期间又来新报，丢弃这一帧
+    shot.src=url;
+    card.style.display='block';        // 瞬间硬切，无过渡
+    chime();
+    clearTimeout(hideTimer);
+    hideTimer=setTimeout(hideNow,(s.cancel?Math.min(HOLD,10):HOLD)*1000);
+  };
+  pre.onerror=()=>{};
+  pre.src=url;
+}
+async function poll(){
+  try{
+    const r=await fetch('/api/overlay/state?t='+Date.now(),{cache:'no-store'});
+    const s=await r.json();
+    if(first){
+      first=false;last=s.seq;          // 浏览器源重启时不重播旧警报
+      if(REPLAY&&s.has&&!s.hidden)show(s);
+    }else if(s.seq>last){
+      last=s.seq;
+      if(s.hidden)hideNow();else if(s.has)show(s);
+    }
+  }catch(e){}
+  setTimeout(poll,POLL);
+}
+// 预览时点一下可解锁音频自动播放（OBS CEF 通常无需）
+addEventListener('pointerdown',()=>{if(ac&&ac.state==='suspended')ac.resume()},{once:true});
+poll();
+</script></body></html>"##;
 
 const HTML: &str = r##"<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -408,6 +597,25 @@ button.primary:hover{filter:brightness(1.12)}
   </div>
  </div>
 </div>
+<div class="card" style="margin:0 26px 20px">
+ <h2>OBS 播出联动（NHK 式瞬间弹出）</h2>
+ <div style="font-size:13px;color:var(--sub);line-height:1.9">
+  在 OBS 添加「浏览器源」，URL 填 <code style="color:var(--yellow)">http://127.0.0.1:__PORT__/obs</code>，
+  宽 1920 / 高 1080，勾选透明背景。新报到来时蓝框瞬间硬切覆盖到节目画面上，
+  播放提示音，保持 __HOLDMSG__ 秒后瞬间消失；取消报自动缩短。<b>没有滚动字幕、没有淡入动画。</b>
+ </div>
+ <div class="tools" style="margin-top:12px">
+  <a href="/obs?preview=1&replay=1" target="_blank" style="color:var(--yellow);font-size:13px;text-decoration:none;border:1px solid var(--line);border-radius:7px;padding:7px 13px">预览叠加层</a>
+  <button id="obsAlert">演练：警报弹出</button>
+  <button id="obsCancel">演练：取消</button>
+  <button id="obsHide">立即收起</button>
+  <span id="obsState" style="font-size:12px;color:var(--sub);align-self:center">—</span>
+ </div>
+ <div style="font-size:12px;color:var(--sub);margin-top:10px">
+  图像源联动（无需 WebSocket）：把 OBS「图像源」指向
+  <code>output/obs/overlay.png</code>，该文件在每次新报时原子替换、自动刷新。
+ </div>
+</div>
 <div class="foot">素材：NHK 屏模板 / 取消画面 · 字体 A-OTF UD新ゴ Pr6N · GIS 気象庁 予報区 · 震央地名 GeoJSON · 数据 P2P地震情報 JSON API v2</div>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -459,4 +667,28 @@ if(ib)ib.onclick=async()=>{
 if(/iPad|iPhone|iPod/.test(navigator.userAgent)&&!navigator.standalone){showInstall('添加到主屏幕')}
 addEventListener('appinstalled',()=>{if(ib)ib.hidden=true});
 if(location.search.indexOf('demo=1')>=0){$('#demo').click()}
+
+// ---- OBS 播出演练 ----
+function obsPayload(mode){
+  const p=new URLSearchParams();
+  p.set('mode',mode);p.set('lat',$('#lat').value);p.set('lon',$('#lon').value);p.set('name',$('#name').value);
+  p.set('prefs',$$('input[name=pref]:checked').map(x=>x.value).join(','));
+  return p;
+}
+async function obsPost(url,p){
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p});
+    const j=await r.json();
+    $('#obsState').textContent='已推送 seq='+j.seq;
+  }catch(e){$('#obsState').textContent='推送失败: '+e}
+}
+$('#obsAlert').onclick=()=>obsPost('/api/overlay/test',obsPayload('alert'));
+$('#obsCancel').onclick=()=>obsPost('/api/overlay/test',obsPayload('cancel'));
+$('#obsHide').onclick=()=>obsPost('/api/overlay/hide',new URLSearchParams());
+setInterval(async()=>{
+  try{
+    const j=await (await fetch('/api/overlay/state',{cache:'no-store'})).json();
+    $('#obsState').textContent='seq='+j.seq+' · '+(j.hidden?'已收起':j.has?'播出中':'待机');
+  }catch(e){}
+},1500);
 </script></body></html>"##;

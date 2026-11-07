@@ -34,10 +34,23 @@ if (-not $created) {
 
 $restarts = 0
 while ($true) {
+    # OBS linkage: read the password straight from obs-websocket's own config so
+    # it keeps working after the user changes it in OBS (nothing hardcoded here).
+    $argList = @('--auto', '--interval', '3', '--obs-ws', '--obs-source', 'EEW-Overlay', '--obs-hold', '20')
+    $obsCfg = Join-Path $env:APPDATA 'obs-studio\plugin_config\obs-websocket\config.json'
+    if (Test-Path -LiteralPath $obsCfg) {
+        try {
+            $cfg = Get-Content -LiteralPath $obsCfg -Raw | ConvertFrom-Json
+            if ($cfg.server_password) { $argList += @('--obs-password', [string]$cfg.server_password) }
+            if ($cfg.server_port) { $argList += @('--obs-port', [string]$cfg.server_port) }
+        } catch {
+            Write-Log "obs-websocket config unreadable; continuing without password"
+        }
+    }
     $start = Get-Date
     $code = -1
     try {
-        $p = Start-Process -FilePath $exe -ArgumentList '--auto', '--interval', '3' `
+        $p = Start-Process -FilePath $exe -ArgumentList $argList `
              -WorkingDirectory $root -WindowStyle Hidden -PassThru -Wait
         $code = $p.ExitCode
     } catch {

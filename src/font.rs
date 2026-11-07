@@ -1,6 +1,6 @@
 //! CFF/OTF glyph rasterization and styled text layout (no external rasterizer).
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::HashMap;
 
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
@@ -9,7 +9,7 @@ use crate::canvas::{even_odd_mask, Canvas, Color};
 
 pub struct Font {
     data: &'static [u8],
-    cache: RefCell<HashMap<(char, u32, u32), Glyph>>,
+    cache: Mutex<HashMap<(char, u32, u32), Glyph>>,
 }
 
 #[derive(Clone)]
@@ -98,13 +98,13 @@ impl OutlineBuilder for Builder {
 
 impl Font {
     pub fn new(data: &'static [u8]) -> Self {
-        Self { data, cache: RefCell::new(HashMap::new()) }
+        Self { data, cache: Mutex::new(HashMap::new()) }
     }
 
     pub fn glyph(&self, ch: char, size: f32, sx: f32) -> Glyph {
         let key = (ch, (size * 10.0) as u32, (sx * 1000.0) as u32);
-        if let Some(g) = self.cache.borrow().get(&key) {
-            return g.clone();
+        if let Some(g) = self.cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return g;
         }
         let face = Face::parse(self.data, 0).expect("font parse");
         let upem = face.units_per_em() as f32;
@@ -146,7 +146,9 @@ impl Font {
             let advance = face.glyph_hor_advance(gid).unwrap_or(0) as f32 * scale * sx;
             Glyph { w, h, ox, oy, mask, advance }
         };
-        self.cache.borrow_mut().insert(key, g.clone());
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert(key, g.clone());
+        }
         g
     }
 

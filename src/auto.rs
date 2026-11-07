@@ -16,6 +16,8 @@ use crate::data::{load_epicenters, load_geo, Epicenter, Geo};
 use crate::font::Font;
 use crate::log;
 use crate::net::{self, EewEvent};
+use crate::obs;
+use crate::obsws;
 use crate::render::{self, Input, FONT_HEAVY, FONT_MEDIUM};
 
 const GEO_BIN: &[u8] = include_bytes!("../data/geometry.bin");
@@ -26,11 +28,15 @@ pub struct AutoState {
     pub interval: u64,
     pub include_test: bool,
     pub process_latest_on_start: bool,
+    pub overlay: obs::Shared,
+    pub obs_ws: Option<obsws::Config>,
+    pub obs_hold: u64,
 }
 
-/// 生成一张（或一张取消画面），返回是否写入成功。
+/// 生成一张（或一张取消画面）。成功时顺带返回一份可直接推给 OBS 的播出事件；
+/// 离线回放调用方不需要这份事件时忽略返回值即可。
 pub fn write_png(dir: &PathBuf, event: &EewEvent, geo: &Geo, eps: &[Epicenter],
-                 heavy: &Font, medium: &Font) -> bool {
+                 heavy: &Font, medium: &Font) -> Option<obs::OverlayEvent> {
     let prefs = geo.normalize_prefs(&event.prefs);
     let input = Input {
         lat: if event.has_coords { event.lat } else { 35.0 },
@@ -51,11 +57,15 @@ pub fn write_png(dir: &PathBuf, event: &EewEvent, geo: &Geo, eps: &[Epicenter],
                 out.note
             ));
             let _ = fs::write(dir.join("latest.png"), &out.png);
-            true
+            Some(obs::event(
+                0, event.cancelled, event.test,
+                &event.event_id, &event.serial,
+                &out.epicenter, &out.note, out.lines.clone(), out.png.clone(),
+            ))
         }
         Err(e) => {
             log::warn(&format!("[自动] 写入失败 {}: {}", path.display(), e));
-            false
+            None
         }
     }
 }
@@ -78,8 +88,9 @@ fn tick(ctx: &mut Ctx, state: &AutoState) -> Result<usize, String> {
         if state.process_latest_on_start {
             if let Some(e) = events.first() {
                 if !(e.test && !state.include_test) {
-                    if write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
+                    if let Some(ev) = write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
                         written += 1;
+                        obs::publish_and_arm(&state.overlay, ev, state.obs_ws.clone(), state.obs_hold);
                     }
                 }
             }
@@ -102,8 +113,9 @@ fn tick(ctx: &mut Ctx, state: &AutoState) -> Result<usize, String> {
                 log::info(&format!("[自动] 跳过测试报 {}", e.id));
                 continue;
             }
-            if write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
+            if let Some(ev) = write_png(&state.out_dir, e, &ctx.geo, &ctx.eps, &ctx.heavy, &ctx.medium) {
                 written += 1;
+                obs::publish_and_arm(&state.overlay, ev, state.obs_ws.clone(), state.obs_hold);
             }
         }
     }

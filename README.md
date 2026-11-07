@@ -39,6 +39,8 @@ PNG 编解码、矢量填充与抗锯齿、CFF 字体轮廓解析、地图投影
 - **地区名自动整合**：完全按 NHK 的排版法则处理（见下）
 - **PWA**：界面可安装为桌面／手机应用，离线也能打开外壳
 - **开机自启 + 自愈常驻**：计划任务登录即启，守护脚本在进程异常退出后自动拉起
+- **OBS 播出联动**：新报时蓝框在节目画面上瞬间硬切弹出、播放提示音、到时瞬间消失；
+  浏览器源 / 图像源 / obs-websocket 三种接法均可，无字幕、无淡入动画
 
 ## 快速开始
 
@@ -59,6 +61,84 @@ cargo build --release
 ```
 
 其余参数见 `--help`：`--lat/--lon/--name/--prefs/--cancel/--out/--outdir/--interval/--port/--log`。
+
+## OBS 播出联动（NHK 式瞬间弹出）
+
+真实 NHK 的速报是「啪」地一下**硬切**覆盖到正在播出的节目画面上：蓝框瞬间出现、
+播放提示音、保持一段时间后瞬间消失；**没有淡入动画，也没有滚动字幕**，节目画面
+始终透在下面。本项目按这个行为实现。
+
+蓝框的位置按一张实际播出画面逐像素量得（见下表），换算到 1920×1080 画布后：
+宽 62.6%、水平中心 49.7%、垂直中心 70.5%。默认值 `w=63 / y=70` 与之误差在 1% 内。
+
+| 实测项 | NHK 实拍 | 本项目默认 |
+|---|---|---|
+| 卡片宽度 | 62.6% | 63% |
+| 水平中心 | 49.7% | 50% |
+| 垂直中心 | 70.5% | 70% |
+| 上／下缘 | 52.5% / 88.5% | 51.4% / 88.5% |
+
+### 快速接入
+
+```bash
+# 1. OBS → 工具 → WebSocket 服务器设置 → 启用（默认 4455；密码由脚本自动读取）
+python tools/obs_setup.py                          # 在当前场景创建浏览器源 EEW-Overlay
+python tools/obs_setup.py --screenshot out.png     # 抓 OBS 场景截图验证
+python tools/obs_setup.py --hide                   # 手动隐藏来源
+```
+
+浏览器源 URL：`http://127.0.0.1:18787/obs`（宽 1920、高 1080、透明背景）。
+脚本会设置 `reroute_audio=true`，让 Web Audio 合成的提示音进入 OBS 混音器。
+也可以手动添加浏览器源，填同一个 URL。
+
+接入完成后在主界面点「演练：警报弹出」，OBS 里会立刻出现蓝框。
+
+### 三种联动方式
+
+| 方式 | 做法 | 特点 |
+|---|---|---|
+| **浏览器源**（推荐） | OBS 加浏览器源指向 `/obs` | 透明叠加、提示音、瞬间弹出/消失、自动收起，零配置 |
+| **图像源** | OBS 图像源指向 `output/obs/overlay.png` | 每次新报原子替换并自动刷新，最稳，但无音效与自动收起 |
+| **obs-websocket** | 启动加 `--obs-ws --obs-source EEW-Overlay` | 新报显示指定来源、播完隐藏，可与图像源方案叠加使用 |
+
+自启动脚本 `tools/standby.ps1` 已带 `--obs-ws`，并直接从
+`%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json` 读取密码与端口，
+OBS 里改密码后无需改本项目的配置。
+
+### 页面参数
+
+`/obs?<参数>`：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `w` | `63` | 卡片宽度百分比 |
+| `y` | `70` | 卡片垂直中心百分比 |
+| `hold` | `20` | 保持秒数；取消报自动缩短到 10 秒 |
+| `sound` | `1` | `0` 关闭提示音 |
+| `full` | `0` | `1` 卡片铺满画布宽 |
+| `preview` | `0` | `1` 加一层假节目背景，仅用于浏览器里验收（OBS 里不要带） |
+| `replay` | `0` | `1` 页面加载时重播当前一条，方便调试 |
+
+提示音由 Web Audio 合成（上行二音 ×2），**不是 NHK 原声采样**。
+浏览器源重启时会把当前 seq 当作已播过，不会重播旧警报。
+若 OBS 里听不到声音，检查该浏览器源在混音器里是否静音、以及 OBS 是否允许浏览器源音频。
+
+### 演练与状态接口
+
+主界面有「演练：警报弹出 / 取消 / 立即收起」三个按钮；也可直接调用：
+
+```bash
+curl -X POST -d 'mode=alert&name=岩手県沖&lat=39.5&lon=142.2&prefs=青森,岩手,宮城,秋田' \
+     http://127.0.0.1:18787/api/overlay/test
+curl -X POST http://127.0.0.1:18787/api/overlay/hide       # 立即收起
+curl     http://127.0.0.1:18787/api/overlay/state           # 当前播出状态（seq / 区域 / 演练标志）
+curl     http://127.0.0.1:18787/api/overlay/png  -o now.png # 当前画面 PNG
+```
+
+新报与演练走同一条发布链路：`auto` 线程出图 → 更新共享状态 → 原子写
+`output/obs/overlay.png` + `overlay.json` → 浏览器源轮询到新 seq 硬切显示 →
+obs-websocket 显示来源 → 计时结束后隐藏。浏览器源轮询间隔 250ms；
+由于数据源本身每 3 秒轮询一次，端到端延迟主要来自数据源。
 
 ## 安装为应用（PWA）
 
@@ -143,7 +223,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\uninstall_autostart.ps
 | `src/render.rs` | 版式常量、移动视野投影、府県名自动整合与换行、黄色副标题排版 |
 | `src/data.rs` | 读取 `data/geometry.bin`（简化后的预报区多边形）与 `data/epicenters.bin` |
 | `src/net.rs` | 通过系统 `curl` 取 HTTPS（避免 Windows 下 TLS 依赖 C 编译器），`serde_json` 解析 |
-| `src/server.rs` | 手写 HTTP/1.1 服务，内嵌单页界面 + `POST /api/render` 返回 base64 PNG；同源提供 manifest / Service Worker / 图标 |
+| `src/server.rs` | 手写 HTTP/1.1 服务，每连接一线程；内嵌单页界面 + `POST /api/render` 返回 base64 PNG，同源提供 manifest / Service Worker / 图标，以及 `/obs` 叠加页与 `/api/overlay/*` 播出接口 |
+| `src/obs.rs` | 播出共享状态（seq / PNG / 区域 / 取消标志）、`overlay.png` 原子替换、`obs-websocket` 显示→保持→隐藏的计时编排 |
+| `src/obsws.rs` | obs-websocket v5 客户端：手写 WebSocket 握手/帧与 SHA256 认证，控制指定来源显隐；默认关闭、失败静默降级 |
 | `src/auto.rs` | 轮询、去重、按 `eventId_serial` 命名落盘；单次巡检包 `catch_unwind` 防线程猝死，每 20 分钟心跳 |
 | `src/log.rs` | 文件日志（本地时间戳、4MB 轮转），后台隐藏运行时唯一的观测入口 |
 

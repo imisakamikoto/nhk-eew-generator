@@ -41,12 +41,14 @@ fn tune_i(name: &str, default: usize) -> usize {
 }
 
 // Typography measured from the reference screenshots
+// Note: vertical rhythm re-measured from a 2-line broadcast frame — line pitch
+// is 1.474x the cap height (95.7px at 1215 width), not the 1.2x it used to be.
 const PREF_SIZE: f32 = 66.0;
 const PREF_SX: f32 = 0.82;
-const PREF_GAP: f32 = 52.0;
+const PREF_GAP: f32 = 53.0;
 const PREF_LEFT: f32 = 353.0;
-const PREF_TOP: f32 = 189.0;
-const PREF_PITCH: f32 = 76.0;
+const PREF_TOP: f32 = 198.0;
+const PREF_PITCH: f32 = 96.0;
 const PREF_OUTLINE: usize = 0;
 
 const SUB_SIZE: f32 = 56.0;
